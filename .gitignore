@@ -1,0 +1,10 @@
+# Ignore all hidden files and directories
+.*
+**/.*
+
+# Keep ignore rules tracked
+!.gitignore
+!**/.gitignore
+
+# Ignore dataset directory
+data/
