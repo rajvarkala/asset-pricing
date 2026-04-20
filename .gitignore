@@ -6,5 +6,15 @@
 !.gitignore
 !**/.gitignore
 
-# Ignore dataset directory
-data/
+# Ignore only the root dataset directory
+/data/
+
+# Ignore Python bytecode cache directories
+__pycache__/
+**/__pycache__/
+
+# Ignore packaging metadata artifacts
+*.egg-info/
+**/*.egg-info/
+*.egg-info
+**/*.egg-info
