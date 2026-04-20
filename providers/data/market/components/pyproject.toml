@@ -1,0 +1,8 @@
+[tool.uv.workspace]
+members = [
+  "db-interface",
+  "instruments-crawler",
+  "historical-crawler",
+  "provider-api",
+  "gateway-api",
+]
