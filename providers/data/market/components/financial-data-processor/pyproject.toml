@@ -1,0 +1,43 @@
+[project]
+name = "financial-data-processor"
+version = "0.1.0"
+description = "Financial data processor with hierarchical row ordering and date-based serialization"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "db-interface",
+  "sqlalchemy>=2.0.38",
+  "psycopg[binary]>=3.2.6",
+  "pydantic-settings>=2.8.1",
+  "pandas>=2.1.0",
+  "python-dateutil>=2.8.2",
+]
+
+[tool.uv.sources]
+db-interface = { workspace = true }
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.5",
+  "ruff>=0.11.7",
+  "mypy>=1.15.0",
+]
+
+[project.scripts]
+financial-data-processor = "financial_data_processor.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
