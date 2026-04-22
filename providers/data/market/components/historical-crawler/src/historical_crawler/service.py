@@ -5,18 +5,33 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 from kiteconnect import KiteConnect
-from kiteconnect.exceptions import NetworkException
+from kiteconnect.exceptions import InputException, NetworkException
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from db_interface.models import DailyCandle, Instrument
+from db_interface.models import CrawlState, DailyCandle, Instrument
 from .settings import settings
 
 START_YEARS_BACK = 25
-MAX_HISTORICAL_RETRIES = 5
+MAX_HISTORICAL_RETRIES = 1
 BASE_RETRY_SECONDS = 2
 MAX_DAYS_PER_REQUEST = 1900
+CRAWLER_NAME = "historical-crawler"
+
+
+def should_retry_historical_error(exc: Exception) -> bool:
+    global MAX_HISTORICAL_RETRIES
+
+    if isinstance(exc, NetworkException):
+        MAX_HISTORICAL_RETRIES = 3
+        return True
+
+    if isinstance(exc, InputException):
+        MAX_HISTORICAL_RETRIES = 1
+        return "invalid token" in str(exc).lower()
+
+    return False
 
 
 def build_kite_client() -> KiteConnect:
@@ -53,6 +68,43 @@ def list_target_instruments(session: Session, instrument_token: int | None = Non
 def latest_candle_date(session: Session, instrument_token: int) -> date | None:
     stmt = select(func.max(DailyCandle.candle_date)).where(DailyCandle.instrument_token == instrument_token)
     return session.scalar(stmt)
+
+
+def crawl_state_scope(instrument_token: int) -> str:
+    return f"instrument:{instrument_token}"
+
+
+def get_crawl_cursor_date(session: Session, instrument_token: int) -> date | None:
+    stmt = select(CrawlState.cursor_date).where(
+        CrawlState.crawler_name == CRAWLER_NAME,
+        CrawlState.scope == crawl_state_scope(instrument_token),
+    )
+    return session.scalar(stmt)
+
+
+def save_crawl_state(session: Session, instrument_token: int, cursor_date: date) -> None:
+    now = datetime.utcnow()
+    scope = crawl_state_scope(instrument_token)
+    state = session.scalar(
+        select(CrawlState).where(
+            CrawlState.crawler_name == CRAWLER_NAME,
+            CrawlState.scope == scope,
+        )
+    )
+
+    if state is None:
+        state = CrawlState(
+            crawler_name=CRAWLER_NAME,
+            scope=scope,
+            cursor_date=cursor_date,
+            last_success_at=now,
+        )
+        session.add(state)
+    else:
+        state.cursor_date = cursor_date
+        state.last_success_at = now
+
+    session.commit()
 
 
 def delete_candles(session: Session, instrument_token: int) -> None:
@@ -115,10 +167,13 @@ def crawl_one_instrument(
         delete_candles(session, instrument_token)
         from_date = start_date
     else:
-        latest = latest_candle_date(session, instrument_token)
+        latest = get_crawl_cursor_date(session, instrument_token)
+        if latest is None:
+            latest = latest_candle_date(session, instrument_token)
         from_date = (latest + timedelta(days=1)) if latest else start_date
 
     if from_date > today:
+        save_crawl_state(session, instrument_token, today)
         return 0
 
     candles: list[dict[str, Any]] = []
@@ -142,12 +197,15 @@ def crawl_one_instrument(
                 )
                 last_error = None
                 break
-            except NetworkException as exc:
+            except (NetworkException, InputException) as exc:
+                if not should_retry_historical_error(exc):
+                    raise
+
                 last_error = exc
                 if attempt == MAX_HISTORICAL_RETRIES:
                     break
 
-                # Exponential backoff for rate-limit and transient network responses.
+                # Exponential backoff for transient historical-data failures.
                 sleep_for = BASE_RETRY_SECONDS * (2 ** (attempt - 1))
                 time_module.sleep(sleep_for)
 
@@ -157,4 +215,15 @@ def crawl_one_instrument(
         candles.extend(chunk_candles)
         chunk_start = chunk_end + timedelta(days=1)
 
-    return upsert_candles(session, instrument_token, candles)
+    changed = upsert_candles(session, instrument_token, candles)
+
+    if candles:
+        max_candle_date = max(
+            item["date"].date() if hasattr(item["date"], "date") else item["date"]
+            for item in candles
+        )
+        save_crawl_state(session, instrument_token, max_candle_date)
+    else:
+        save_crawl_state(session, instrument_token, today)
+
+    return changed
