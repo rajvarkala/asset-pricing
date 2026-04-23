@@ -3,11 +3,13 @@ from __future__ import annotations
 import csv
 import io
 import json
+import os
 from datetime import datetime, timedelta
 from collections import defaultdict
 
 from AlgorithmImports import *
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
 
 def _extract_sector_names(company_sector: object) -> list[str]:
     """Extract all sector names from company_sector JSON payload."""
@@ -29,6 +31,19 @@ def _extract_sector_names(company_sector: object) -> list[str]:
         return []
 
     return [str(x).strip() for x in path if str(x).strip()]
+
+
+def build_session_local():
+    """Build a SQLAlchemy session factory from environment variables."""
+    db_host = os.getenv("DB_HOST", "host.docker.internal")
+    db_port = os.getenv("DB_PORT", "5432")
+    db_user = os.getenv("DB_USER", "market")
+    db_password = os.getenv("DB_PASSWORD", "market")
+    db_name = os.getenv("DB_NAME", "market")
+
+    url = f"postgresql+psycopg://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+    engine = create_engine(url, future=True)
+    return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
 def build_universe_payload(session_local) -> dict[str, object]:
@@ -106,6 +121,7 @@ def write_universe_to_object_store(
 
     Columns: date,symbol,weight,indexes_json,sectors_json
     """
+    print(f"Writing universe payload to Object Store with key='{key}'...")
     universe = payload.get("universe", [])
     if not isinstance(universe, list):
         raise TypeError("payload['universe'] must be a list")
@@ -134,67 +150,7 @@ def write_universe_to_object_store(
     qb.object_store.save(key, csv_text)
     return key
 
-
-def run_selector(qb: QuantBook, key: str, selector_fn) -> list:
-    """
-    Drive the selector function in QuantBook context.
-
-    In QuantBook, qb.history(universe, ...) does NOT invoke the selector —
-    that only happens during live/backtest algorithm execution.
-    This function manually reads the Object Store CSV, parses the latest
-    date's rows into lightweight alt_coarse objects, and calls selector_fn
-    directly, exactly mirroring what the algorithm engine does per trading day.
-
-    Returns the list of selected Symbols.
-    """
-    if not qb.object_store.contains_key(key):
-        raise FileNotFoundError(f"Object Store key not found: {key}")
-
-    raw = qb.object_store.read(key)
-    lines = raw.splitlines()
-    if len(lines) < 2:
-        print(f"[run_selector] Object Store '{key}' is empty — no symbols to select.")
-        return []
-
-    rows = []
-    for line in lines[1:]:          # skip header
-        if not line or not line[0].isnumeric():
-            continue
-        items = next(csv.reader([line]))
-        if len(items) < 5:
-            continue
-        rows.append({
-            "date"        : items[0],
-            "nse_code"    : items[1],
-            "weight"      : float(items[2]),
-            "indexes_json": items[3],
-            "sectors_json": items[4],
-        })
-
-    if not rows:
-        print(f"[run_selector] No parseable rows in Object Store '{key}'.")
-        return []
-
-    # Use only the most-recent date (one call per date — same as algorithm engine)
-    latest_date = max(r["date"] for r in rows)
-    latest_rows = [r for r in rows if r["date"] == latest_date]
-    print(f"[run_selector] Driving selector for date={latest_date}, rows={len(latest_rows)}")
-
-    class _Row:
-        """Lightweight PythonData stand-in that selector_fn can index with []."""
-        def __init__(self, r: dict) -> None:
-            self.symbol = Symbol.create(r["nse_code"], SecurityType.EQUITY, Market.INDIA)
-            self._r = r
-        def __getitem__(self, key):
-            return self._r.get(key)
-
-    alt_coarse = [_Row(r) for r in latest_rows]
-    selected = selector_fn(alt_coarse)
-    print(f"[run_selector] Selector returned {len(selected)} symbol(s): "
-          f"{[s.value for s in selected]}")
-    return selected
-
-
+ 
 class ComponentUniverseData(PythonData):
     """Custom universe data reader compatible with LEAN selector methodology."""
 

@@ -1,18 +1,17 @@
 # region imports
 from __future__ import annotations
 
-import json
 from datetime import timedelta
-from typing import List
+from typing import Any, List
 
 from AlgorithmImports import *
 
 import db_universe_custom_data
 from db_universe_custom_data import ComponentUniverseData
-from db_tick_custom_data import DbDailyByTradingsymbol, SessionLocal
 # endregion
 
 OBJECT_STORE_KEY = "portfolio-targets.csv"
+USE_DB_UNIVERSE = False
 
 # Selector filter sets — edit here to change universe scope.
 INDEX_FILTERS: frozenset[str] = frozenset({"BSE 1000"})
@@ -21,13 +20,13 @@ SECTOR_FILTERS: frozenset[str] = frozenset({"Information Technology"})
 
 class UniverseBehaviorAlgorithm(QCAlgorithm):
     """
-    Backtest: custom DB-backed universe with date-parity selector logic.
+    Backtest: selector-driven universe with date-parity selector logic.
 
       Odd calendar day  → index OR sector filter  (wider universe)
       Even calendar day → index AND sector filter (narrower universe)
 
-    Universe is refreshed daily. on_securities_changed logs entries/exits.
-    on_data equal-weights holdings whenever price data is available.
+    Universe candidates are rebuilt each time the selector is called.
+    If DB access fails inside Docker, a deterministic fallback list is used.
     """
 
     def initialize(self) -> None:
@@ -35,32 +34,72 @@ class UniverseBehaviorAlgorithm(QCAlgorithm):
         self.set_end_date(2026, 4, 23)
         self.set_cash(10_000_000)
 
-        # Build current universe from DB and write to Object Store with a
-        # lookback large enough to cover the full 10-year backtest window.
-        payload = db_universe_custom_data.build_universe_payload(session_local=SessionLocal)
-        db_universe_custom_data.write_universe_to_object_store(
-            qb=self,
-            payload=payload,
-            key=OBJECT_STORE_KEY,
-            lookback_days=3_700,
-        )
-        ComponentUniverseData.OBJECT_STORE_KEY = OBJECT_STORE_KEY
-
         # Universe settings: refresh every calendar day at market open.
         self.universe_settings.schedule.on(self.date_rules.every_day())
         self.universe_settings.resolution = Resolution.DAILY
         self.universe_settings.minimum_time_in_universe = timedelta(1)
         self.universe_settings.data_normalization_mode = DataNormalizationMode.SPLIT_ADJUSTED
 
-        self._weight_by_symbol: dict[Symbol, float] = {}
-        self._custom_data_symbols: dict[str, Symbol] = {}   # nse_code → custom-data symbol
+        # Fallback rows keep the algorithm deterministic if DB connectivity is
+        # unavailable in the LEAN Docker runtime.
+        self._fallback_rows: list[dict[str, Any]] = [
+            {
+                "nse_code": "INFY",
+                "indexes": ["BSE 1000"],
+                "sectors": ["Information Technology"],
+            },
+            {
+                "nse_code": "KSOLVES",
+                "indexes": [],
+                "sectors": ["Information Technology"],
+            },
+            {
+                "nse_code": "SANOFICONR",
+                "indexes": ["BSE 1000"],
+                "sectors": ["Healthcare"],
+            },
+        ]
 
-        self.add_universe(
+        # Keep selector callbacks alive via custom-universe plumbing,
+        # but actual universe membership is rebuilt inside the selector.
+        db_universe_custom_data.write_universe_to_object_store(
+            qb=self,
+            payload={
+                "total_symbols": len(self._fallback_rows),
+                "universe": self._fallback_rows,
+                "universe_nse_codes": [x["nse_code"] for x in self._fallback_rows],
+            },
+            key=OBJECT_STORE_KEY,
+            lookback_days=3_700,
+        )
+        ComponentUniverseData.OBJECT_STORE_KEY = OBJECT_STORE_KEY
+
+        self._weight_by_symbol: dict[Symbol, float] = {}
+        self._db_failed = False
+
+        self._universe = self.add_universe(
             ComponentUniverseData,
             "ComponentUniverse",
             Resolution.DAILY,
             self._selector,
         )
+
+    def _build_rows_for_selector(self) -> tuple[list[dict[str, Any]], str]:
+        if not USE_DB_UNIVERSE:
+            return self._fallback_rows, "fallback"
+
+        if not self._db_failed:
+            try:
+                session_local = db_universe_custom_data.build_session_local()
+                payload = db_universe_custom_data.build_universe_payload(session_local=session_local)
+                rows = payload.get("universe", [])
+                if isinstance(rows, list) and rows:
+                    return rows, "db"
+            except Exception as exc:
+                self._db_failed = True
+                self.debug(f"DB universe rebuild failed. Falling back to local rows. Reason: {exc}")
+
+        return self._fallback_rows, "fallback"
 
     # ------------------------------------------------------------------ #
     #  Selector — OR on odd days, AND on even days                        #
@@ -69,22 +108,32 @@ class UniverseBehaviorAlgorithm(QCAlgorithm):
     def _selector(self, alt_coarse: List[ComponentUniverseData]) -> List[Symbol]:
         is_odd = self.time.day % 2 == 1
         logic = "OR  (odd)" if is_odd else "AND (even)"
+        rows, source = self._build_rows_for_selector()
 
         chosen: dict[Symbol, float] = {}
-        for d in alt_coarse:
-            indexes = set(json.loads(d["indexes_json"] or "[]"))
-            sectors = set(json.loads(d["sectors_json"] or "[]"))
+        for row in rows:
+            code = str(row.get("nse_code", "")).strip()
+            if not code:
+                continue
+
+            indexes = set(str(x) for x in row.get("indexes", []) if str(x).strip())
+            sectors = set(str(x) for x in row.get("sectors", []) if str(x).strip())
 
             matches_index = not INDEX_FILTERS or bool(indexes & INDEX_FILTERS)
             matches_sector = not SECTOR_FILTERS or bool(sectors & SECTOR_FILTERS)
 
             passes = (matches_index or matches_sector) if is_odd else (matches_index and matches_sector)
             if passes:
-                chosen[d.symbol] = float(d["weight"])
+                chosen[Symbol.create(code, SecurityType.EQUITY, Market.INDIA)] = 1.0
 
-        self.debug(f"[{self.time.date()}] [{logic}] selected {len(chosen)} symbols")
-        self._weight_by_symbol = chosen
-        return list(chosen.keys())
+        if chosen:
+            equal_weight = 1.0 / len(chosen)
+            self._weight_by_symbol = {s: equal_weight for s in chosen}
+        else:
+            self._weight_by_symbol = {}
+
+        self.debug(f"[{self.time.date()}] [{logic}] source={source} selected {len(self._weight_by_symbol)} symbols")
+        return list(self._weight_by_symbol.keys())
 
     # ------------------------------------------------------------------ #
     #  Universe membership changes                                        #
@@ -94,16 +143,10 @@ class UniverseBehaviorAlgorithm(QCAlgorithm):
         for removed in changes.removed_securities:
             nse = removed.symbol.value
             self.liquidate(removed.symbol)
-            self._custom_data_symbols.pop(nse, None)
             self.debug(f"  REMOVED {nse}  | portfolio: {len(self._weight_by_symbol)} symbol(s)")
 
         for added in changes.added_securities:
             nse = added.symbol.value
-            # Subscribe to DB daily price data for this NSE code so on_data
-            # can fill orders.  add_data is idempotent for a given name.
-            if nse not in self._custom_data_symbols:
-                sub = self.add_data(DbDailyByTradingsymbol, nse, Resolution.DAILY)
-                self._custom_data_symbols[nse] = sub.symbol
             self.debug(f"  ADDED   {nse}  | portfolio: {len(self._weight_by_symbol)} symbol(s)")
 
     # ------------------------------------------------------------------ #
@@ -115,7 +158,5 @@ class UniverseBehaviorAlgorithm(QCAlgorithm):
             return
 
         for equity_symbol, weight in self._weight_by_symbol.items():
-            nse = equity_symbol.value
-            custom_sym = self._custom_data_symbols.get(nse)
-            if custom_sym and data.contains_key(custom_sym):
+            if data.bars.contains_key(equity_symbol):
                 self.set_holdings(equity_symbol, weight)

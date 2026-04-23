@@ -179,9 +179,7 @@
         "CSharp",
         "Python"
     ],
-    "python-additional-paths": [
-        "/Users/raj/ws/quantconnect/providers/data/market/.venv/lib/python3.13/site-packages"
-    ],
+    "python-additional-paths": [],
     "environments": {
         "backtesting": {
             "live-mode": false,
