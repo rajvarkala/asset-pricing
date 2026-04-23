@@ -7,4 +7,5 @@ members = [
   "gateway-api",
   "financial-data-processor",
   "sector-tree",
+  "index-constituents",
 ]

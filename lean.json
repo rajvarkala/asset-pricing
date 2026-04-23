@@ -179,7 +179,9 @@
         "CSharp",
         "Python"
     ],
-    "python-additional-paths": [],
+    "python-additional-paths": [
+        "/Users/raj/ws/quantconnect/providers/data/market/.venv/lib/python3.13/site-packages"
+    ],
     "environments": {
         "backtesting": {
             "live-mode": false,
@@ -644,6 +646,6 @@
     },
     "job-organization-id": "b4b8f15716150a04359a4a31b62b04f4",
     "organization-id": "b4b8f15716150a04359a4a31b62b04f4",
-    "file-database-last-update": "04/14/2026 18:37:10",
+    "file-database-last-update": "04/23/2026 23:21:10",
     "id": "Local"
 }
