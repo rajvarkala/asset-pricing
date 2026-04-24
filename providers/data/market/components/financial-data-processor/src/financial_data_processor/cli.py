@@ -12,7 +12,12 @@ from sqlalchemy.orm import sessionmaker
 from db_interface.models import CompanyInfo, FinancialData
 from db_interface import load_processed_financial_dataframe_from_db
 
-from .service import process_all_financial_data_database, process_and_write_financial_data_database
+from .service import (
+    derive_fundamentals_all,
+    derive_fundamentals_for_nse_code,
+    process_all_financial_data_database,
+    process_and_write_financial_data_database,
+)
 from .settings import settings
 
 
@@ -27,12 +32,53 @@ def main() -> int:
             dest="nse_code",
             help="Process only the company matched by NSE trading symbol (e.g. INFY)",
         )
+        parser.add_argument(
+            "--derive-fundamentals",
+            dest="derive_fundamentals",
+            action="store_true",
+            default=False,
+            help=(
+                "Run the derived-fundamentals transformer pipeline instead of the "
+                "raw-data ingestion pipeline.  Results are written back to "
+                "processed_financial_data with section_id='derived_fundamentals'."
+            ),
+        )
         args = parser.parse_args()
 
         engine = create_engine(settings.database_url, pool_pre_ping=True)
         SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
         with SessionLocal() as session:
+            # ----------------------------------------------------------------
+            # Derived-fundamentals mode
+            # ----------------------------------------------------------------
+            if args.derive_fundamentals:
+                if args.nse_code:
+                    print(f"Deriving fundamentals for NSE code '{args.nse_code}'...")
+                    result_df = derive_fundamentals_for_nse_code(session, args.nse_code)
+                    if result_df.empty:
+                        print("No derived fundamentals were produced.")
+                    else:
+                        print(f"✓ Derived {len(result_df.index)} metric(s):")
+                        for metric in result_df.index:
+                            print(f"  - {metric}")
+                        print("\nDerived fundamentals DataFrame:")
+                        print(result_df.to_string())
+                else:
+                    print("Deriving fundamentals for all NSE codes with processed data...")
+                    results = derive_fundamentals_all(session)
+                    total_metrics = sum(results.values())
+                    print(
+                        f"✓ Processed {len(results)} NSE code(s), "
+                        f"{total_metrics} total metric row(s) derived"
+                    )
+                    for nse_code, count in sorted(results.items()):
+                        print(f"  {nse_code}: {count} metric(s)")
+                return 0
+
+            # ----------------------------------------------------------------
+            # Raw financial data ingestion mode (original behaviour)
+            # ----------------------------------------------------------------
             if args.nse_code:
                 print(f"Processing financial data for NSE code '{args.nse_code}' and writing to database...")
                 company = session.query(CompanyInfo).filter(CompanyInfo.nse_code == args.nse_code).first()

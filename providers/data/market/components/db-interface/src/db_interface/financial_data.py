@@ -423,7 +423,10 @@ def process_all_financial_data_to_db(session: Session) -> dict[str, dict[str, in
     results: dict[str, dict[str, int]] = {}
 
     for company_id, section_id in combinations:
-        _, rows_written = process_and_write_financial_data_to_db(session, company_id, section_id)
+        try:
+            _, rows_written = process_and_write_financial_data_to_db(session, company_id, section_id)
+        except ValueError:
+            continue
 
         if company_id not in results:
             results[company_id] = {}
