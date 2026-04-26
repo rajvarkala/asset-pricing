@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
+from io import StringIO
 import pickle
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from db_interface import (
@@ -27,7 +28,6 @@ from db_interface.models import CompanyInfo, DailyCandle, FinancialData, Instrum
 
 
 logger = logging.getLogger(__name__)
-
 
 def process_and_serialize_financial_data(
     session: Session,
@@ -179,10 +179,11 @@ def load_all_processed_sections(session: Session, nse_code: str) -> dict[str, pd
         if not record.dataframe_pickle:
             continue
         try:
-            deserialized = pickle.loads(record.dataframe_pickle)
+            json_str = record.dataframe_pickle.decode('utf-8') if isinstance(record.dataframe_pickle, bytes) else record.dataframe_pickle
+            deserialized = pd.read_json(StringIO(json_str), orient='split')
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Could not deserialize pickle for nse_code=%s section_id=%s: %s",
+                "Could not deserialize JSON for nse_code=%s section_id=%s: %s",
                 nse_code, record.section_id, exc,
             )
             continue

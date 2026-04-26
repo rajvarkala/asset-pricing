@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from io import StringIO
 from typing import Any
+
+import pandas as pd
 
 
 FINANCIAL_SCORE_SECTION = "derived_fundamentals"
@@ -39,6 +42,24 @@ def extract_latest_metric(
     Returns:
         The latest numeric value, or None if not found or invalid.
     """
+    metric_series = extract_metric_series(processed_payload, section_id, metric_name)
+    if metric_series is None or metric_series.empty:
+        return None
+
+    for column_name in reversed(list(metric_series.index)):
+        value = coerce_float(metric_series.get(column_name))
+        if value is not None:
+            return value
+
+    return None
+
+
+def extract_metric_series(
+    processed_payload: dict[str, Any],
+    section_id: str,
+    metric_name: str,
+) -> pd.Series | None:
+    """Extract a metric row as a timestamp-indexed numeric Series."""
     if not isinstance(processed_payload, dict):
         return None
 
@@ -46,32 +67,40 @@ def extract_latest_metric(
     if not isinstance(section, dict):
         return None
 
-    rows = section.get("rows", [])
-    metric_row = next(
-        (
-            row
-            for row in rows
-            if isinstance(row, dict) and str(row.get("row_name", "")).strip() == metric_name
-        ),
-        None,
-    )
-
-    if metric_row is None:
+    section_value = section.get("value")
+    if section_value is None:
         return None
 
-    # Get column order from section, or infer from row keys
-    ordered_columns = section.get("columns", [])
-    if not isinstance(ordered_columns, list) or not ordered_columns:
-        ordered_columns = [
-            key
-            for key in metric_row.keys()
-            if key not in {"row_name", "section_id", "columns", "rows"}
-        ]
+    if isinstance(section_value, str):
+        section_frame = pd.read_json(StringIO(section_value), orient="split")
+    elif isinstance(section_value, dict):
+        section_frame = pd.DataFrame(
+            data=section_value.get("data", []),
+            columns=section_value.get("columns", []),
+            index=section_value.get("index", []),
+        )
+    else:
+        return None
 
-    # Iterate columns in reverse (most recent first)
-    for column_name in reversed(ordered_columns):
-        value = coerce_float(metric_row.get(column_name))
-        if value is not None:
-            return value
+    if section_frame.empty:
+        return None
 
-    return None
+    if metric_name in section_frame.index:
+        metric_row = section_frame.loc[metric_name]
+    elif "row_name" in section_frame.columns:
+        matched = section_frame[section_frame["row_name"].astype(str).str.strip() == metric_name]
+        if matched.empty:
+            return None
+        metric_row = matched.iloc[0]
+    else:
+        return None
+
+    if isinstance(metric_row, pd.DataFrame):
+        metric_row = metric_row.iloc[0]
+
+    if "row_name" in metric_row.index:
+        metric_row = metric_row.drop(labels=["row_name"])
+
+    metric_series = pd.to_numeric(metric_row, errors="coerce").dropna()
+    metric_series.index = metric_series.index.map(str)
+    return metric_series

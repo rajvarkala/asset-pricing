@@ -343,7 +343,8 @@ def write_processed_financial_data_to_db(
     session.flush()
 
     # Persist a single serialized dataframe payload for this company/section.
-    payload = pickle.dumps(df)
+    payload = df.to_json(orient='split').encode('utf-8')
+
     processed_record = ProcessedFinancialData(
         company_id=company_id,
         nse_code=nse_code,
@@ -379,7 +380,9 @@ def load_processed_financial_dataframe_from_db(
     if record is None or not record.dataframe_pickle:
         return pd.DataFrame()
 
-    deserialized = pickle.loads(record.dataframe_pickle)
+    # Decode bytes to string if needed, then deserialize JSON
+    json_str = record.dataframe_pickle.decode('utf-8') if isinstance(record.dataframe_pickle, bytes) else record.dataframe_pickle
+    deserialized = pd.read_json(StringIO(json_str), orient='split')
     if isinstance(deserialized, pd.DataFrame):
         return deserialized
 

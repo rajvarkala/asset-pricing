@@ -3,8 +3,9 @@ from __future__ import annotations
 import csv
 import io
 import json
-import os
+import io
 import pickle
+import os
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Any
@@ -67,38 +68,12 @@ def _deserialize_processed_financial_section(section_id: object, dataframe_pickl
     if not section_id or not dataframe_pickle:
         return None
 
-    try:
-        # Try standard unpickling first
-        deserialized = pickle.loads(dataframe_pickle)
-    except (TypeError, AttributeError, ValueError):
-        # Pandas version mismatch (StringDtype initialization changed)
-        # Return minimal structure to allow code to continue
-        return {
-            "section_id": str(section_id),
-            "columns": [],
-            "rows": [],
-        }
-    except Exception:
-        # Other unpickling errors
-        return None
-
-    if hasattr(deserialized, "iterrows") and hasattr(deserialized, "columns"):
-        rows = []
-        for row_name, values in deserialized.iterrows():
-            row = {"row_name": _json_safe(row_name)}
-            for column_name, value in values.items():
-                row[str(column_name)] = _json_safe(value)
-            rows.append(row)
-
-        return {
-            "section_id": str(section_id),
-            "columns": [str(column_name) for column_name in deserialized.columns],
-            "rows": rows,
-        }
+    # Keep raw JSON payload string so consumers can materialize DataFrame as needed.
+    json_str = dataframe_pickle.decode('utf-8') if isinstance(dataframe_pickle, bytes) else str(dataframe_pickle)
 
     return {
         "section_id": str(section_id),
-        "value": _json_safe(deserialized),
+        "value": json_str,
     }
 
 
@@ -143,6 +118,8 @@ def build_universe_payload(session_local) -> dict[str, object]:
             )
         ).fetchall()
 
+
+
     by_nse: dict[str, dict[str, Any]] = defaultdict(
         lambda: {
             "indexes": set(),
@@ -161,7 +138,7 @@ def build_universe_payload(session_local) -> dict[str, object]:
 
         for sector in _extract_sector_names(company_sector):
             by_nse[code]["sectors"].add(sector)
-
+                
         if section_id and section_id not in by_nse[code]["processed_financial_data"]:
             section_payload = _deserialize_processed_financial_section(section_id, dataframe_pickle)
             if section_payload is not None:
@@ -182,6 +159,7 @@ def build_universe_payload(session_local) -> dict[str, object]:
                 "processed_financial_data": by_nse[code]["processed_financial_data"],
             }
         )
+                
 
     return {
         "total_symbols": len(universe),
