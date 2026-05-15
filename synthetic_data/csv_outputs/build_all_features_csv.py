@@ -6,7 +6,7 @@ from pathlib import Path
 root = Path('/Users/raj/ws/quantconnect')
 data_dir = root / 'synthetic_data'
 panel_path = data_dir / 'synthetic_equity_monthly_10y.csv'
-predictors_path = root / 'top_predictors_page33_dedup_enriched.csv'
+predictors_path = data_dir / 'predictor_pipeline' / 'top_predictors_page33_dedup_enriched.csv'
 
 # Output CSVs
 csv_dir = data_dir / 'csv_outputs'
