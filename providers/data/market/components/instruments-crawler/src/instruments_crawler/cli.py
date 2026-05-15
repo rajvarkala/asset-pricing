@@ -22,7 +22,7 @@ def run_sync() -> None:
     except OperationalError as exc:
         logger.error(
             "Database connection failed. Start postgres first: "
-            "cd /Users/raj/ws/quantconnect/providers/data/market && docker compose up -d postgres"
+            "cd /Users/raj/ws/asset-pricing/providers/data/market && docker compose up -d postgres"
         )
         raise SystemExit(1) from exc
 

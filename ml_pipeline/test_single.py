@@ -17,7 +17,7 @@ from ml_pipeline.evaluation import TimeSeriesSplitter, ModelEvaluator
 
 # Load data
 print("Loading data...")
-pipeline_root = Path('/Users/raj/ws/quantconnect')
+pipeline_root = Path(__file__).resolve().parent.parent
 loader = DataLoader(pipeline_root)
 data = loader.prepare()
 print(f"  Train: {len(data['train'])} rows, {len(data['train_dates'])} months")
@@ -31,9 +31,12 @@ print(f"\nTesting {model_id}...")
 predictor_cols = data['base_3_predictors']
 print(f"  Predictors: {predictor_cols}")
 
-# Time-series CV: 36 months initial, 36 months rolling
+# Time-series CV: 1-year monthly validation within training window
 print("\n  Running rolling CV...")
-splitter = TimeSeriesSplitter(initial_train_months=36, cv_months=36)
+splitter = TimeSeriesSplitter(
+    initial_train_months=data['initial_train_months'],
+    cv_months=data['validation_months'],
+)
 train_folds = splitter.split(data['train_dates'])
 print(f"  Generated {len(train_folds)} CV folds")
 

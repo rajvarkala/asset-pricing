@@ -3,7 +3,7 @@ import numpy as np
 from pathlib import Path
 
 # Paths
-root = Path('/Users/raj/ws/quantconnect')
+root = Path('/Users/raj/ws/asset-pricing')
 data_dir = root / 'synthetic_data'
 panel_path = data_dir / 'synthetic_equity_monthly_10y.csv'
 predictors_path = data_dir / 'predictor_pipeline' / 'top_predictors_page33_dedup_enriched.csv'

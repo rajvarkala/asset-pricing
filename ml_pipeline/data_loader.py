@@ -1,7 +1,7 @@
 """
 Data preparation for ML pipeline.
 - Load features, compute return premium
-- Train/test split (6y / 4y)
+- Train/test split (9y / 1y)
 - Feature selection (3-predictor vs all)
 """
 from pathlib import Path
@@ -35,13 +35,14 @@ class DataLoader:
         
         return features, ff, panel
 
-    def prepare(self):
+    def prepare(self, max_tickers: int | None = None, ticker_sample_seed: int = 42):
         """
         Prepare data:
         - Load features and merge with returns from panel
         - Compute return premium = return - rf_monthly (from tbl)
+        - Shift predictors by one month within each ticker
         - Select predictors and labels
-        - Return train (6y) / test (4y) split
+        - Return train (9y) / test (1y) split
         """
         features, ff, panel = self.load_raw()
         
@@ -54,21 +55,36 @@ class DataLoader:
         # Compute return premium
         merged['rf_monthly'] = merged['tbl'] / 12.0
         merged['return_premium'] = merged['return'] - merged['rf_monthly']
+
+        # Shift predictors by one month within each ticker so predictors at t-1 predict premium at t.
+        predictor_feature_cols = [c for c in features.columns if c not in {'date', 'ticker'}]
+        merged[predictor_feature_cols] = merged.groupby('ticker')[predictor_feature_cols].shift(1)
         
         # Sort by date, ticker
         merged = merged.sort_values(['date', 'ticker']).reset_index(drop=True)
+
+        if max_tickers is not None:
+            unique_tickers = np.array(sorted(merged['ticker'].unique()))
+            if max_tickers < len(unique_tickers):
+                rng = np.random.default_rng(ticker_sample_seed)
+                selected = sorted(rng.choice(unique_tickers, size=max_tickers, replace=False).tolist())
+                merged = merged[merged['ticker'].isin(selected)].copy()
         
         # Extract dates
         dates = sorted(merged['date'].unique())
         n_months = len(dates)
         
-        # Split: first 6*12=72 months for train, last 4*12=48 for test
-        cutoff_idx = 72
+        # Split: first 9 years for train, last 1 year for test
+        test_months = 12
+        cutoff_idx = n_months - test_months
         train_cutoff_date = dates[cutoff_idx - 1]
-        test_cutoff_date = dates[-1]
         
         train = merged[merged['date'] <= train_cutoff_date].copy()
         test = merged[merged['date'] > train_cutoff_date].copy()
+
+        train_months = len(sorted(train['date'].unique()))
+        validation_months = 12
+        initial_train_months = train_months - validation_months
         
         # Get predictor column names (exclude identifiers, dates, returns, rf, tbl)
         exclude_cols = {
@@ -88,6 +104,8 @@ class DataLoader:
             'test': test,
             'train_dates': sorted(train['date'].unique()),
             'test_dates': sorted(test['date'].unique()),
+            'initial_train_months': initial_train_months,
+            'validation_months': validation_months,
             'base_3_predictors': base_3_predictors,
             'all_predictors': all_predictors,
             'tickers': sorted(merged['ticker'].unique()),
@@ -95,7 +113,7 @@ class DataLoader:
 
 
 if __name__ == '__main__':
-    root = Path('/Users/raj/ws/quantconnect')
+    root = Path('/Users/raj/ws/asset-pricing')
     loader = DataLoader(root)
     data = loader.prepare()
     

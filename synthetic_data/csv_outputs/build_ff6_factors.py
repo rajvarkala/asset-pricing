@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 
-ROOT = Path('/Users/raj/ws/quantconnect')
+ROOT = Path('/Users/raj/ws/asset-pricing')
 DATA_DIR = ROOT / 'synthetic_data'
 OUT_DIR = DATA_DIR / 'csv_outputs'
 

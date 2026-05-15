@@ -41,7 +41,7 @@ def build_kite_client() -> KiteConnect:
     if not api_key or not access_token:
         raise SystemExit(
             "KITE_API_KEY and KITE_ACCESS_TOKEN must be set in "
-            "/Users/raj/ws/quantconnect/providers/data/market/.env"
+            "/Users/raj/ws/asset-pricing/providers/data/market/.env"
         )
 
     kite = KiteConnect(api_key=api_key)

@@ -103,14 +103,14 @@ Environment variables:
 - `SERIALIZED_DATA_PATH` (legacy pickle-to-disk flow)
 
 This component resolves `.env` from the market root automatically:
-- `/Users/raj/ws/quantconnect/providers/data/market/.env`
+- `/Users/raj/ws/asset-pricing/providers/data/market/.env`
 
 So running from `components` still picks up the correct DB credentials.
 
 ## Minimal Setup
 
 ```bash
-cd /Users/raj/ws/quantconnect/providers/data/market/components
+cd /Users/raj/ws/asset-pricing/providers/data/market/components
 pip install -e ./db-interface
 pip install -e ./financial-data-processor
 ```
@@ -151,7 +151,7 @@ Handled:
 ## Development
 
 ```bash
-cd /Users/raj/ws/quantconnect/providers/data/market/components/financial-data-processor
+cd /Users/raj/ws/asset-pricing/providers/data/market/components/financial-data-processor
 pip install -e ".[dev]"
 pytest
 ruff check src tests

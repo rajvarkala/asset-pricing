@@ -1,0 +1,37 @@
+{
+  "OLS-3_L2": {
+    "alpha": 0.1,
+    "tol": 0.0001
+  },
+  "OLS-3_Huber": {
+    "epsilon": 1.2,
+    "max_iter": 300,
+    "tol": 0.0001
+  },
+  "OLS-all_L2": {
+    "alpha": 10.0,
+    "tol": 0.0001
+  },
+  "OLS-all_Huber": {
+    "epsilon": 0.05,
+    "max_iter": 200,
+    "tol": 0.001
+  },
+  "OLS-all_Huber-EN": {
+    "alpha": 0.01,
+    "l1_ratio": 0.2,
+    "max_iter": 400,
+    "tol": 0.001
+  },
+  "RF": {
+    "n_estimators": 50,
+    "max_depth": 4,
+    "min_samples_split": 500,
+    "n_jobs": -1
+  },
+  "GBRF_Huber": {
+    "n_estimators": 30,
+    "max_depth": 3,
+    "learning_rate": 0.05
+  }
+}
