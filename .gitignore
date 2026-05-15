@@ -1,0 +1,5 @@
+
+# Exclude heavyweight local datasets and generated outputs
+data/
+providers/
+p2/backtests/
