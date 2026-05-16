@@ -67,9 +67,9 @@ class ModelFactory:
         ])
     
     @staticmethod
-    def rf(n_estimators=50, max_depth=8, min_samples_split=10, 
+    def rf(n_estimators=50, max_depth=8, min_samples_split=50, 
             criterion='squared_error', random_state=42, n_jobs=-1):
-        """Random Forest with variance reduction impurity (lowered min_samples_split for small universes)."""
+        """Random Forest with variance reduction impurity."""
         return RandomForestRegressor(
             n_estimators=n_estimators,
             max_depth=max_depth,

@@ -74,10 +74,13 @@ for model in $MODELS; do
     --parameter report-dir "$REPORTS_REL" \
     --extra-docker-config "$LEAN_DOCKER_NO_LIMITS"
 
-  # Pick the backtest result json (exclude summary and monitor files).
+  # Pick the main backtest result packet, not order events or monitor artifacts.
   BT_JSON=$(find "$OUT_DIR" -maxdepth 1 -type f -name '*.json' \
+    | grep -E '/[0-9]+\.json$' \
+    | grep -v 'order-events' \
     | grep -v 'summary.json' \
     | grep -v 'data-monitor-report' \
+    | sort \
     | head -1)
 
   if [[ -z "$BT_JSON" ]]; then

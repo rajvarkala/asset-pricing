@@ -124,6 +124,8 @@ class MLMonthlyEventDrivenBacktest(QCAlgorithm):
         self.benchmark_nav = 1.0
         self.prev_weights: Dict[str, float] = {}
         self.rebalance_records: List[dict] = []
+        self._benchmark_history: List[tuple[pd.Timestamp, float]] = []
+        self._month_records: Dict[str, dict] = {}
         self._month_weights: Dict[str, Dict[str, float]] = {}
         self._last_rebalance_month: str = ""
 
@@ -135,12 +137,23 @@ class MLMonthlyEventDrivenBacktest(QCAlgorithm):
 
         # Precompute all monthly synthetic returns/NAVs and portfolio weights.
         self._run_backtest_event_loop()
+        self.set_benchmark(self._benchmark_value)
 
         # Subscribe each ticker as custom data so Lean's time loop advances month by month.
         self._ticker_to_symbol: Dict[str, Symbol] = {}
         for ticker in self.universe_tickers:
             sym = self.add_data(SyntheticEquity, ticker).symbol
             self._ticker_to_symbol[ticker] = sym
+
+    def _benchmark_value(self, time: datetime) -> float:
+        current = pd.Timestamp(time).tz_localize(None)
+        value = 1.0
+        for month_end, nav in self._benchmark_history:
+            if month_end <= current:
+                value = nav
+            else:
+                break
+        return float(value)
 
     def _load_and_prepare_data(self) -> None:
         loader = DataLoader(self._inputs_root)
@@ -232,27 +245,18 @@ class MLMonthlyEventDrivenBacktest(QCAlgorithm):
 
         self.strategy_nav *= 1.0 + strategy_ret
         self.benchmark_nav *= 1.0 + benchmark_ret
+        self._benchmark_history.append((month_end, self.benchmark_nav))
 
-        self.rebalance_records.append(
-            {
-                "date": month_end,
-                "strategy_return": strategy_ret,
-                "benchmark_return": benchmark_ret,
-                "turnover": turnover,
-                "strategy_nav": self.strategy_nav,
-                "benchmark_nav": self.benchmark_nav,
-            }
-        )
-
-        self.plot("Cumulative", "Strategy", self.strategy_nav)
-        self.plot("Cumulative", "Benchmark", self.benchmark_nav)
-        self.plot("Rebalance", "StrategyReturn", strategy_ret)
-        self.plot("Rebalance", "BenchmarkReturn", benchmark_ret)
-        self.plot("Rebalance", "Turnover", 0.0 if np.isnan(turnover) else float(turnover))
-
-        self.set_runtime_statistic("Model", self.model_id)
-        self.set_runtime_statistic("Date", month_end.strftime("%Y-%m"))
-        self.set_runtime_statistic("Ret(%)", f"{strategy_ret * 100:.2f}")
+        record = {
+            "date": month_end,
+            "strategy_return": strategy_ret,
+            "benchmark_return": benchmark_ret,
+            "turnover": turnover,
+            "strategy_nav": self.strategy_nav,
+            "benchmark_nav": self.benchmark_nav,
+        }
+        self.rebalance_records.append(record)
+        self._month_records[month_end.strftime("%Y-%m")] = record
 
         self.debug(f"Benchmark return for {month_end}: {benchmark_ret}")
 
@@ -272,6 +276,21 @@ class MLMonthlyEventDrivenBacktest(QCAlgorithm):
         for ticker, sym in self._ticker_to_symbol.items():
             if ticker not in weights and self.portfolio[sym].invested:
                 self.liquidate(sym)
+
+        record = self._month_records.get(current_month)
+        if record is None:
+            return
+
+        self.plot("Cumulative", "Strategy", float(record["strategy_nav"]))
+        self.plot("Cumulative", "Benchmark", float(record["benchmark_nav"]))
+        self.plot("Rebalance", "StrategyReturn", float(record["strategy_return"]))
+        self.plot("Rebalance", "BenchmarkReturn", float(record["benchmark_return"]))
+        turnover = record["turnover"]
+        self.plot("Rebalance", "Turnover", 0.0 if np.isnan(turnover) else float(turnover))
+
+        self.set_runtime_statistic("Model", self.model_id)
+        self.set_runtime_statistic("Date", current_month)
+        self.set_runtime_statistic("Ret(%)", f"{float(record['strategy_return']) * 100:.2f}")
 
     def on_end_of_algorithm(self) -> None:
         if not self.rebalance_records:
