@@ -1,6 +1,6 @@
 {
     "algorithm-language": "Python",
     "parameters": {},
-    "description": "",
+    "description": "ML model OLS-3_L2 with parameters alpha=0.1, tol=0.0001. Strategy: Monthly event-driven asset pricing strategy that reuses the shared ML pipeline, lags features by one month, ranks the universe by predicted excess return, and forms a value-weighted long-short overlay against a synthetic benchmark while exporting portfolio and factor diagnostics.",
     "local-id": 393393591
 }

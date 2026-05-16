@@ -1,9 +1,11 @@
 # region imports
 from __future__ import annotations
 
+import csv
 import json
 import sys
 from pathlib import Path
+from time import perf_counter
 from typing import Dict, List
 
 import numpy as np
@@ -21,11 +23,24 @@ from ml_pipeline.models import ModelRegistry
 from datetime import datetime, timedelta
 
 
+def _synthetic_equity_path() -> Path:
+    return ML_INPUTS_ROOT / "synthetic_data" / "synthetic_equity_monthly_10y.csv"
+
+
+def _synthetic_equity_split_dir() -> Path:
+    return ML_INPUTS_ROOT / "synthetic_data" / "by_ticker"
+
+
+def _synthetic_equity_ticker_path(ticker: str) -> Path:
+    return _synthetic_equity_split_dir() / f"{ticker}.csv"
+
+
 class SyntheticEquity(PythonData):
     """Monthly custom data backed by synthetic equity CSV (one row per ticker per month-end)."""
 
     def get_source(self, config, date, is_live_mode):
-        path = str(ML_INPUTS_ROOT / "synthetic_data" / "synthetic_equity_monthly_10y.csv")
+        ticker_path = _synthetic_equity_ticker_path(config.symbol.value)
+        path = str(ticker_path if ticker_path.exists() else _synthetic_equity_path())
         return SubscriptionDataSource(path, SubscriptionTransportMedium.LOCAL_FILE)
 
     def reader(self, config, line, date, is_live_mode):
@@ -127,6 +142,10 @@ class MLMonthlyEventDrivenBacktest(QCAlgorithm):
         self._benchmark_history: List[tuple[pd.Timestamp, float]] = []
         self._month_records: Dict[str, dict] = {}
         self._month_weights: Dict[str, Dict[str, float]] = {}
+        self._test_month_lookup: Dict[str, pd.Timestamp] = {
+            pd.Timestamp(month_end).strftime("%Y-%m"): pd.Timestamp(month_end)
+            for month_end in self.test_dates
+        }
         self._last_rebalance_month: str = ""
 
         self.debug(f"Model={self.model_id} | Train/Test split=30/70 by months")
@@ -135,9 +154,11 @@ class MLMonthlyEventDrivenBacktest(QCAlgorithm):
             self.debug(f"Ticker cap enabled: {self.max_tickers}")
         self.debug(f"Test months: {len(self.test_dates)} ({self.test_dates[0].date()} to {self.test_dates[-1].date()})")
 
-        # Precompute all monthly synthetic returns/NAVs and portfolio weights.
-        self._run_backtest_event_loop()
         self.set_benchmark(self._benchmark_value)
+
+        # Split the shared monthly custom data into per-ticker files so each Lean
+        # subscription reads only its own rows instead of scanning the full panel.
+        self._ensure_custom_data_files()
 
         # Subscribe each ticker as custom data so Lean's time loop advances month by month.
         self._ticker_to_symbol: Dict[str, Symbol] = {}
@@ -174,6 +195,7 @@ class MLMonthlyEventDrivenBacktest(QCAlgorithm):
 
         # Bring market cap from raw panel because DataLoader.prepare returns return-only merge.
         _, ff, panel = loader.load_raw()
+        self._panel = panel.copy()
         if "market_cap" in panel.columns:
             mcap_df = panel[["date", "ticker", "market_cap"]].copy()
             self.data = self.data.merge(mcap_df, on=["date", "ticker"], how="left")
@@ -187,11 +209,31 @@ class MLMonthlyEventDrivenBacktest(QCAlgorithm):
 
         self.universe_tickers = sorted(self.data["ticker"].unique().tolist())
 
+    def _ensure_custom_data_files(self) -> None:
+        split_dir = _synthetic_equity_split_dir()
+        split_dir.mkdir(parents=True, exist_ok=True)
+
+        missing = [ticker for ticker in self.universe_tickers if not _synthetic_equity_ticker_path(ticker).exists()]
+        if not missing:
+            return
+
+        panel = self._panel[self._panel["ticker"].isin(missing)].copy()
+        if panel.empty:
+            return
+
+        panel = panel.sort_values(["ticker", "date"])
+        for ticker, ticker_df in panel.groupby("ticker", sort=False):
+            ticker_path = _synthetic_equity_ticker_path(str(ticker))
+            ticker_df.to_csv(ticker_path, index=False)
+
+        self.debug(f"Prepared {len(missing)} per-ticker custom data files for Lean subscriptions.")
+
     def _run_backtest_event_loop(self) -> None:
         for month_end in self.test_dates:
             self._rebalance_for_month(pd.Timestamp(month_end))
 
     def _rebalance_for_month(self, month_end: pd.Timestamp) -> None:
+        started_at = perf_counter()
         train_df = self.data[self.data["date"] < month_end]
         month_df = self.data[self.data["date"] == month_end].copy()
 
@@ -203,10 +245,14 @@ class MLMonthlyEventDrivenBacktest(QCAlgorithm):
         y_train = train_df["return_premium"].values
 
         model = ModelRegistry.get_model(self.model_id, hparam_override=self.model_params)
+        fit_started_at = perf_counter()
         model.fit(x_train, y_train)
+        fit_elapsed = perf_counter() - fit_started_at
 
+        predict_started_at = perf_counter()
         month_df["pred"] = model.predict(month_df[self.predictor_cols].fillna(0.0).values)
         month_df = month_df.sort_values("pred", ascending=False).reset_index(drop=True)
+        predict_elapsed = perf_counter() - predict_started_at
 
         n = max(1, len(month_df) // 10)
         top = month_df.head(n).copy()
@@ -258,13 +304,30 @@ class MLMonthlyEventDrivenBacktest(QCAlgorithm):
         self.rebalance_records.append(record)
         self._month_records[month_end.strftime("%Y-%m")] = record
 
+        self.debug(
+            f"Rebalance {month_end.strftime('%Y-%m')}: train_rows={len(train_df)} month_rows={len(month_df)} "
+            f"fit={fit_elapsed:.2f}s predict={predict_elapsed:.2f}s total={perf_counter() - started_at:.2f}s"
+        )
         self.debug(f"Benchmark return for {month_end}: {benchmark_ret}")
 
     def on_data(self, data: Slice) -> None:
         """Use precomputed weights to place real Lean orders each month on custom data bars."""
         current_month = self.time.strftime("%Y-%m")
+        has_custom_data = any(data.contains_key(sym) for sym in self._ticker_to_symbol.values())
+        if not has_custom_data:
+            return
+
         if current_month == self._last_rebalance_month:
             return
+
+        month_end = self._test_month_lookup.get(current_month)
+        if month_end is None:
+            return
+
+        if current_month not in self._month_weights:
+            self.debug(f"Computing month state for {current_month}")
+            self._rebalance_for_month(month_end)
+
         weights = self._month_weights.get(current_month)
         if weights is None:
             return

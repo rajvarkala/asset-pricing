@@ -8,8 +8,8 @@ set -euo pipefail
 #   ./run_lean_reports.sh 10
 #   ./run_lean_reports.sh 5 OLS-3_L2
 
-MAX_TICKERS="${1:-10}"
-MODEL_ID_FILTER="${2:-}"
+MAX_TICKERS="${1-10}"
+MODEL_ID_FILTERS=("${@:2}")
 # Explicitly run Docker without CPU/memory caps for backtests.
 LEAN_DOCKER_NO_LIMITS='{"nano_cpus": 0, "mem_limit": 0, "memswap_limit": 0}'
 
@@ -21,6 +21,7 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 P2_DIR="$ROOT_DIR/p2"
+CONFIG_JSON="$P2_DIR/config.json"
 
 TS="$(date +%Y-%m-%d_%H-%M-%S)"
 RUN_DIR="$P2_DIR/backtests/$TS"
@@ -28,6 +29,14 @@ REPORTS_REL="backtests/$TS/reports"
 
 mkdir -p "$P2_DIR/ml_inputs/synthetic_data/csv_outputs"
 mkdir -p "$RUN_DIR"
+
+CONFIG_BACKUP="$(mktemp)"
+cp "$CONFIG_JSON" "$CONFIG_BACKUP"
+restore_config() {
+  cp "$CONFIG_BACKUP" "$CONFIG_JSON"
+  rm -f "$CONFIG_BACKUP"
+}
+trap restore_config EXIT
 
 # Stage shared ML code and data for Lean Docker runtime.
 rm -rf "$P2_DIR/ml_inputs/ml_pipeline"
@@ -40,6 +49,56 @@ cp "$ROOT_DIR/synthetic_data/csv_outputs/ff6_factors_10y.csv" \
 cp "$ROOT_DIR/synthetic_data/synthetic_equity_monthly_10y.csv" \
    "$P2_DIR/ml_inputs/synthetic_data/"
 
+BASE_DESCRIPTION=$($PYTHON_BIN - <<PY
+import json
+from pathlib import Path
+
+config_path = Path(r"$CONFIG_JSON")
+with open(config_path, 'r', encoding='utf-8') as f:
+  config = json.load(f)
+print(config.get('description', '').strip())
+PY
+)
+
+write_model_description() {
+  local model="$1"
+
+  MODEL_NAME="$model" \
+  CONFIG_JSON_PATH="$CONFIG_JSON" \
+  BEST_PARAMS_PATH="$ROOT_DIR/ml_results_cache/best_params.json" \
+  BASE_DESCRIPTION_TEXT="$BASE_DESCRIPTION" \
+  $PYTHON_BIN - <<'PY'
+import json
+import os
+from pathlib import Path
+
+config_path = Path(os.environ['CONFIG_JSON_PATH'])
+best_params_path = Path(os.environ['BEST_PARAMS_PATH'])
+model = os.environ['MODEL_NAME']
+base_description = os.environ['BASE_DESCRIPTION_TEXT'].strip()
+
+with open(best_params_path, 'r', encoding='utf-8') as f:
+  params_by_model = json.load(f)
+
+params = params_by_model.get(model, {})
+if params:
+  formatted_params = ', '.join(f"{key}={params[key]}" for key in sorted(params))
+else:
+  formatted_params = 'default parameters'
+
+description = f"ML model {model} with parameters {formatted_params}. Strategy: {base_description}"
+
+with open(config_path, 'r', encoding='utf-8') as f:
+  config = json.load(f)
+
+config['description'] = description
+
+with open(config_path, 'w', encoding='utf-8') as f:
+  json.dump(config, f, indent=4)
+  f.write('\n')
+PY
+}
+
 # Read model ids from cached parameters.
 MODELS=$($PYTHON_BIN - <<'PY'
 import json
@@ -51,8 +110,8 @@ print(' '.join(data.keys()))
 PY
 )
 
-if [[ -n "$MODEL_ID_FILTER" ]]; then
-  MODELS="$MODEL_ID_FILTER"
+if [[ ${#MODEL_ID_FILTERS[@]} -gt 0 ]]; then
+  MODELS="${MODEL_ID_FILTERS[*]}"
 fi
 
 cd "$P2_DIR"
@@ -66,13 +125,21 @@ declare -a MODEL_BT_JSON=()
 for model in $MODELS; do
   echo "\n=== Backtesting $model ==="
   OUT_DIR="$RUN_DIR/$model"
+  write_model_description "$model"
 
-  lean backtest . \
-    --output "$OUT_DIR" \
-    --parameter model-id "$model" \
-    --parameter max-tickers "$MAX_TICKERS" \
-    --parameter report-dir "$REPORTS_REL" \
+  LEAN_ARGS=(
+    .
+    --output "$OUT_DIR"
+    --parameter model-id "$model"
+    --parameter report-dir "$REPORTS_REL"
     --extra-docker-config "$LEAN_DOCKER_NO_LIMITS"
+  )
+
+  if [[ -n "$MAX_TICKERS" ]]; then
+    LEAN_ARGS+=(--parameter max-tickers "$MAX_TICKERS")
+  fi
+
+  lean backtest "${LEAN_ARGS[@]}"
 
   # Pick the main backtest result packet, not order events or monitor artifacts.
   BT_JSON=$(find "$OUT_DIR" -maxdepth 1 -type f -name '*.json' \
