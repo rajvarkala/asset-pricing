@@ -1,350 +1,358 @@
 # region imports
 from __future__ import annotations
 
-from datetime import timedelta
-from typing import Any, List
+import json
+import sys
+from pathlib import Path
+from typing import Dict, List
 
+import numpy as np
+import pandas as pd
 from AlgorithmImports import *
 
-import db_universe_custom_data
-from db_universe_custom_data import ComponentUniverseData
+# Make staged shared modules importable inside Lean Docker.
+PROJECT_ROOT = Path(__file__).resolve().parent
+ML_INPUTS_ROOT = PROJECT_ROOT / "ml_inputs"
+if str(ML_INPUTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(ML_INPUTS_ROOT))
+
+from ml_pipeline.data_loader import DataLoader
+from ml_pipeline.models import ModelRegistry
+from datetime import datetime, timedelta
+
+
+class SyntheticEquity(PythonData):
+    """Monthly custom data backed by synthetic equity CSV (one row per ticker per month-end)."""
+
+    def get_source(self, config, date, is_live_mode):
+        path = str(ML_INPUTS_ROOT / "synthetic_data" / "synthetic_equity_monthly_10y.csv")
+        return SubscriptionDataSource(path, SubscriptionTransportMedium.LOCAL_FILE)
+
+    def reader(self, config, line, date, is_live_mode):
+        if not line or line.startswith("date"):
+            return None
+        try:
+            parts = line.split(",")
+            if parts[1].strip() != config.symbol.value:
+                return None
+            obj = SyntheticEquity()
+            obj.symbol = config.symbol
+            dt = datetime.strptime(parts[0].strip(), "%Y-%m-%d")
+            obj.time = dt
+            obj.end_time = dt + timedelta(days=1)
+            obj.value = float(parts[2])          # synthetic price
+            obj["monthly_return"] = float(parts[3])
+            obj["market_cap"] = float(parts[4])
+            return obj
+        except Exception:
+            return None
+
+
 # endregion
 
-OBJECT_STORE_KEY = "portfolio-targets.csv"
-USE_DB_UNIVERSE = False
-FINANCIAL_SCORE_SECTION = "derived_fundamentals"
-FINANCIAL_SCORE_ROW = "Market Cap"
 
-# Selector filter sets — edit here to change universe scope.
-INDEX_FILTERS: frozenset[str] = frozenset({"BSE 1000"})
-SECTOR_FILTERS: frozenset[str] = frozenset({"Information Technology"})
-
-
-def _coerce_float(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-
+def _safe_float(value, default=0.0):
     try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-
-    if number != number:
-        return None
-
-    return number
+        out = float(value)
+        return out if np.isfinite(out) else default
+    except Exception:
+        return default
 
 
-def _extract_latest_metric_value(row: dict[str, Any], section_id: str, metric_name: str) -> float | None:
-    processed = row.get("processed_financial_data")
-    if not isinstance(processed, dict):
-        return None
-
-    section = processed.get(section_id)
-    if not isinstance(section, dict):
-        return None
-
-    rows = section.get("rows")
-    if not isinstance(rows, list):
-        return None
-
-    metric_row = None
-    for candidate in rows:
-        if isinstance(candidate, dict) and str(candidate.get("row_name", "")).strip() == metric_name:
-            metric_row = candidate
-            break
-
-    if metric_row is None:
-        return None
-
-    columns = section.get("columns")
-    ordered_columns = [str(column) for column in columns] if isinstance(columns, list) else []
-    if not ordered_columns:
-        ordered_columns = [
-            str(column)
-            for column in metric_row.keys()
-            if str(column) not in {"row_name", "section_id", "columns", "rows"}
-        ]
-
-    for column_name in reversed(ordered_columns):
-        value = _coerce_float(metric_row.get(column_name))
-        if value is not None:
-            return value
-
-    return None
+def _metric_str(value: float, precision: int = 8) -> str:
+    if value is None or not np.isfinite(value):
+        return "nan"
+    return f"{float(value):.{precision}f}"
 
 
-class UniverseBehaviorAlgorithm(QCAlgorithm):
+def _ols_alpha_and_betas(y: np.ndarray, x: np.ndarray) -> tuple[float, np.ndarray]:
+    """Return intercept(alpha) and betas from OLS via least squares."""
+    if y.size == 0:
+        return np.nan, np.full(x.shape[1] if x.ndim == 2 else 0, np.nan)
+
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+
+    valid = np.isfinite(y)
+    valid &= np.all(np.isfinite(x), axis=1)
+    yv = y[valid]
+    xv = x[valid]
+
+    if yv.size < max(3, xv.shape[1] + 2):
+        return np.nan, np.full(xv.shape[1], np.nan)
+
+    design = np.column_stack([np.ones(len(yv)), xv])
+    coeffs, *_ = np.linalg.lstsq(design, yv, rcond=None)
+    return float(coeffs[0]), coeffs[1:]
+
+
+class MLMonthlyEventDrivenBacktest(QCAlgorithm):
     """
-    Backtest: selector-driven universe with date-parity selector logic.
+    Lean event-driven monthly rebalancing backtest for one model.
 
-      Odd calendar day  → index OR sector filter  (wider universe)
-      Even calendar day → index AND sector filter (narrower universe)
-
-    Universe candidates are rebuilt each time the selector is called.
-    If DB access fails inside Docker, a deterministic fallback list is used.
+    - Reuse shared ml_pipeline DataLoader and ModelRegistry
+    - Features are lagged by 1 month in DataLoader.prepare()
+    - Portfolio each month: long top decile, short bottom decile (value-weighted)
+    - Metrics exported to Lean summary statistics and local files
     """
 
     def initialize(self) -> None:
-        self.set_start_date(2016, 4, 23)
-        self.set_end_date(2026, 4, 23)
         self.set_cash(10_000_000)
 
-        # Universe settings: refresh every calendar day at market open.
-        self.universe_settings.schedule.on(self.date_rules.every_day())
-        self.universe_settings.resolution = Resolution.DAILY
-        self.universe_settings.minimum_time_in_universe = timedelta(1)
-        self.universe_settings.data_normalization_mode = DataNormalizationMode.SPLIT_ADJUSTED
+        self.model_id = (self.get_parameter("model-id") or "OLS-3_L2").strip()
+        self.report_dir_param = (self.get_parameter("report-dir") or "backtests/latest/reports").strip()
+        max_tickers_raw = (self.get_parameter("max-tickers") or "").strip()
+        self.max_tickers = int(max_tickers_raw) if max_tickers_raw else None
 
-        # Fallback rows keep the algorithm deterministic if DB connectivity is
-        # unavailable in the LEAN Docker runtime.
-        self._fallback_rows: list[dict[str, Any]] = [
-            {
-                "nse_code": "INFY",
-                "indexes": ["BSE 1000"],
-                "sectors": ["Information Technology"],
-                "processed_financial_data": {
-                    "derived_fundamentals": {
-                        "section_id": "derived_fundamentals",
-                        "columns": ["Apr 2026"],
-                        "rows": [
-                            {
-                                "row_name": "Market Cap",
-                                "Apr 2026": 7_850_000.0,
-                            }
-                        ],
-                    },
-                    "balance-sheet": {
-                        "section_id": "balance-sheet",
-                        "columns": ["Mar 2024", "Mar 2025"],
-                        "rows": [
-                            {
-                                "row_name": "Total Assets",
-                                "Mar 2024": 192340.0,
-                                "Mar 2025": 205110.0,
-                            },
-                            {
-                                "row_name": "Total Liabilities",
-                                "Mar 2024": 71420.0,
-                                "Mar 2025": 75680.0,
-                            },
-                        ],
-                    },
-                    "profit-loss": {
-                        "section_id": "profit-loss",
-                        "columns": ["Mar 2024", "Mar 2025", "TTM"],
-                        "rows": [
-                            {
-                                "row_name": "Revenue",
-                                "Mar 2024": 153670.0,
-                                "Mar 2025": 164220.0,
-                                "TTM": 167005.0,
-                            },
-                            {
-                                "row_name": "Net Profit",
-                                "Mar 2024": 26120.0,
-                                "Mar 2025": 27880.0,
-                                "TTM": 28110.0,
-                            },
-                        ],
-                    },
-                },
-            },
-            {
-                "nse_code": "KSOLVES",
-                "indexes": [],
-                "sectors": ["Information Technology"],
-                "processed_financial_data": {
-                    "derived_fundamentals": {
-                        "section_id": "derived_fundamentals",
-                        "columns": ["Apr 2026"],
-                        "rows": [
-                            {
-                                "row_name": "Market Cap",
-                                "Apr 2026": 185_000.0,
-                            }
-                        ],
-                    },
-                    "balance-sheet": {
-                        "section_id": "balance-sheet",
-                        "columns": ["Mar 2024", "Mar 2025"],
-                        "rows": [
-                            {
-                                "row_name": "Total Assets",
-                                "Mar 2024": 842.0,
-                                "Mar 2025": 913.0,
-                            }
-                        ],
-                    },
-                },
-            },
-            {
-                "nse_code": "SANOFICONR",
-                "indexes": ["BSE 1000"],
-                "sectors": ["Healthcare"],
-                "processed_financial_data": {
-                    "derived_fundamentals": {
-                        "section_id": "derived_fundamentals",
-                        "columns": ["Apr 2026"],
-                        "rows": [
-                            {
-                                "row_name": "Market Cap",
-                                "Apr 2026": 465_000.0,
-                            }
-                        ],
-                    },
-                    "balance-sheet": {
-                        "section_id": "balance-sheet",
-                        "columns": ["Mar 2024", "Mar 2025"],
-                        "rows": [
-                            {
-                                "row_name": "Total Assets",
-                                "Mar 2024": 6210.0,
-                                "Mar 2025": 6475.0,
-                            }
-                        ],
-                    },
-                    "profit-loss": {
-                        "section_id": "profit-loss",
-                        "columns": ["Mar 2024", "Mar 2025", "TTM"],
-                        "rows": [
-                            {
-                                "row_name": "Revenue",
-                                "Mar 2024": 3180.0,
-                                "Mar 2025": 3328.0,
-                                "TTM": 3364.0,
-                            }
-                        ],
-                    },
-                },
-            },
-        ]
+        self._project_root = PROJECT_ROOT
+        self._inputs_root = ML_INPUTS_ROOT
 
-        # Keep selector callbacks alive via custom-universe plumbing,
-        # but actual universe membership is rebuilt inside the selector.
-        db_universe_custom_data.write_universe_to_object_store(
-            qb=self,
-            payload={
-                "total_symbols": len(self._fallback_rows),
-                "universe": self._fallback_rows,
-                "universe_nse_codes": [x["nse_code"] for x in self._fallback_rows],
-            },
-            key=OBJECT_STORE_KEY,
-            lookback_days=3_700,
-        )
-        ComponentUniverseData.OBJECT_STORE_KEY = OBJECT_STORE_KEY
+        best_params_path = self._inputs_root / "best_params.json"
+        if not best_params_path.exists():
+            raise FileNotFoundError(f"Missing cached model params: {best_params_path}")
 
-        self._weight_by_symbol: dict[Symbol, float] = {}
-        self._score_by_symbol: dict[Symbol, float] = {}
-        self._db_failed = False
+        with open(best_params_path, "r", encoding="utf-8") as f:
+            all_params = json.load(f)
+        self.model_params = all_params.get(self.model_id, {})
 
-        self._universe = self.add_universe(
-            ComponentUniverseData,
-            "ComponentUniverse",
-            Resolution.DAILY,
-            self._selector,
-        )
+        self._load_and_prepare_data()
 
-    def _build_rows_for_selector(self) -> tuple[list[dict[str, Any]], str]:
-        if not USE_DB_UNIVERSE:
-            return self._fallback_rows, "fallback"
+        self.set_start_date(self.test_dates[0].year, self.test_dates[0].month, 1)
+        self.set_end_date(self.test_dates[-1].year, self.test_dates[-1].month, 28)
 
-        if not self._db_failed:
-            try:
-                session_local = db_universe_custom_data.build_session_local()
-                payload = db_universe_custom_data.build_universe_payload(session_local=session_local)
-                rows = payload.get("universe", [])
-                if isinstance(rows, list) and rows:
-                    return rows, "db"
-            except Exception as exc:
-                self._db_failed = True
-                self.debug(f"DB universe rebuild failed. Falling back to local rows. Reason: {exc}")
+        self.strategy_nav = 1.0
+        self.benchmark_nav = 1.0
+        self.prev_weights: Dict[str, float] = {}
+        self.rebalance_records: List[dict] = []
+        self._month_weights: Dict[str, Dict[str, float]] = {}
+        self._last_rebalance_month: str = ""
 
-        return self._fallback_rows, "fallback"
+        self.debug(f"Model={self.model_id} | Train/Test split=30/70 by months")
+        self.debug(f"Universe tickers loaded: {len(self.universe_tickers)}")
+        if self.max_tickers is not None:
+            self.debug(f"Ticker cap enabled: {self.max_tickers}")
+        self.debug(f"Test months: {len(self.test_dates)} ({self.test_dates[0].date()} to {self.test_dates[-1].date()})")
 
-    # ------------------------------------------------------------------ #
-    #  Selector — OR on odd days, AND on even days                        #
-    # ------------------------------------------------------------------ #
+        # Precompute all monthly synthetic returns/NAVs and portfolio weights.
+        self._run_backtest_event_loop()
 
-    def _selector(self, alt_coarse: List[ComponentUniverseData]) -> List[Symbol]:
-        is_odd = self.time.day % 2 == 1
-        logic = "OR  (odd)" if is_odd else "AND (even)"
-        rows, source = self._build_rows_for_selector()
+        # Subscribe each ticker as custom data so Lean's time loop advances month by month.
+        self._ticker_to_symbol: Dict[str, Symbol] = {}
+        for ticker in self.universe_tickers:
+            sym = self.add_data(SyntheticEquity, ticker).symbol
+            self._ticker_to_symbol[ticker] = sym
 
-        candidates: dict[Symbol, float | None] = {}
-        for row in rows:
-            code = str(row.get("nse_code", "")).strip()
-            if not code:
-                continue
+    def _load_and_prepare_data(self) -> None:
+        loader = DataLoader(self._inputs_root)
+        prepared = loader.prepare(max_tickers=self.max_tickers)
 
-            indexes = set(str(x) for x in row.get("indexes", []) if str(x).strip())
-            sectors = set(str(x) for x in row.get("sectors", []) if str(x).strip())
+        self.base_3_predictors = prepared["base_3_predictors"]
+        self.all_predictors = prepared["all_predictors"]
+        predictor_type = ModelRegistry.get_predictor_type(self.model_id)
+        self.predictor_cols = self.base_3_predictors if predictor_type == "base_3" else self.all_predictors
 
-            matches_index = not INDEX_FILTERS or bool(indexes & INDEX_FILTERS)
-            matches_sector = not SECTOR_FILTERS or bool(sectors & SECTOR_FILTERS)
+        self.data = pd.concat([prepared["train"], prepared["test"]], ignore_index=True)
 
-            passes = (matches_index or matches_sector) if is_odd else (matches_index and matches_sector)
-            if passes:
-                symbol = Symbol.create(code, SecurityType.EQUITY, Market.INDIA)
-                candidates[symbol] = _extract_latest_metric_value(
-                    row,
-                    FINANCIAL_SCORE_SECTION,
-                    FINANCIAL_SCORE_ROW,
-                )
+        # Build event-driven split as latest 70% months for backtest loop.
+        dates = sorted(self.data["date"].unique())
+        split_idx = int(np.floor(len(dates) * 0.30))
+        split_idx = max(1, min(split_idx, len(dates) - 1))
+        self.test_dates = list(dates[split_idx:])
 
-        scored = {symbol: score for symbol, score in candidates.items() if score is not None and score > 0}
-        if scored:
-            score_sum = sum(scored.values())
-            self._weight_by_symbol = {symbol: score / score_sum for symbol, score in scored.items()}
-            for symbol in candidates:
-                if symbol not in self._weight_by_symbol:
-                    self._weight_by_symbol[symbol] = 0.0
-            self._score_by_symbol = dict(scored)
-        elif candidates:
-            equal_weight = 1.0 / len(candidates)
-            self._weight_by_symbol = {symbol: equal_weight for symbol in candidates}
-            self._score_by_symbol = {}
-        else:
-            self._weight_by_symbol = {}
-            self._score_by_symbol = {}
+        # Bring market cap from raw panel because DataLoader.prepare returns return-only merge.
+        _, ff, panel = loader.load_raw()
+        if "market_cap" in panel.columns:
+            mcap_df = panel[["date", "ticker", "market_cap"]].copy()
+            self.data = self.data.merge(mcap_df, on=["date", "ticker"], how="left")
+        self.data["market_cap"] = self.data.get("market_cap", 1.0)
+        self.data["market_cap"] = self.data["market_cap"].fillna(1.0).clip(lower=1.0)
 
-        score_summary = ", ".join(
-            f"{symbol.value}:{self._score_by_symbol[symbol]:.2f}"
-            for symbol in sorted(self._score_by_symbol.keys(), key=lambda item: item.value)
-        ) or "no financial scores"
-        self.debug(
-            f"[{self.time.date()}] [{logic}] source={source} selected {len(self._weight_by_symbol)} symbols | "
-            f"metric={FINANCIAL_SCORE_ROW} | {score_summary}"
-        )
-        return list(self._weight_by_symbol.keys())
+        self.ff = ff.sort_values("date").copy()
+        for col in ["rf", "mkt_rf", "smb", "hml", "rmw", "cma", "umd"]:
+            if col in self.ff.columns:
+                self.ff[col] = self.ff[col].fillna(0.0)
 
-    # ------------------------------------------------------------------ #
-    #  Universe membership changes                                        #
-    # ------------------------------------------------------------------ #
+        self.universe_tickers = sorted(self.data["ticker"].unique().tolist())
 
-    def on_securities_changed(self, changes: SecurityChanges) -> None:
-        for removed in changes.removed_securities:
-            nse = removed.symbol.value
-            self.liquidate(removed.symbol)
-            self.debug(f"  REMOVED {nse}  | portfolio: {len(self._weight_by_symbol)} symbol(s)")
+    def _run_backtest_event_loop(self) -> None:
+        for month_end in self.test_dates:
+            self._rebalance_for_month(pd.Timestamp(month_end))
 
-        for added in changes.added_securities:
-            nse = added.symbol.value
-            weight = self._weight_by_symbol.get(added.symbol, 0.0)
-            score = self._score_by_symbol.get(added.symbol)
-            if score is None:
-                self.debug(f"  ADDED   {nse}  | weight={weight:.4f} | no {FINANCIAL_SCORE_ROW} score")
-            else:
-                self.debug(f"  ADDED   {nse}  | weight={weight:.4f} | {FINANCIAL_SCORE_ROW}={score:.2f}")
+    def _rebalance_for_month(self, month_end: pd.Timestamp) -> None:
+        train_df = self.data[self.data["date"] < month_end]
+        month_df = self.data[self.data["date"] == month_end].copy()
 
-    # ------------------------------------------------------------------ #
-    #  Trading — equal-weight the active universe when price data arrives #
-    # ------------------------------------------------------------------ #
-
-    def on_data(self, data: Slice) -> None:
-        if not self._weight_by_symbol:
+        min_train_rows = max(24, len(self.predictor_cols) * 2)
+        if len(train_df) < min_train_rows or month_df.empty:
             return
 
-        for equity_symbol, weight in self._weight_by_symbol.items():
-            if data.bars.contains_key(equity_symbol):
-                self.set_holdings(equity_symbol, weight)
+        x_train = train_df[self.predictor_cols].fillna(0.0).values
+        y_train = train_df["return_premium"].values
+
+        model = ModelRegistry.get_model(self.model_id, hparam_override=self.model_params)
+        model.fit(x_train, y_train)
+
+        month_df["pred"] = model.predict(month_df[self.predictor_cols].fillna(0.0).values)
+        month_df = month_df.sort_values("pred", ascending=False).reset_index(drop=True)
+
+        n = max(1, len(month_df) // 10)
+        top = month_df.head(n).copy()
+        bottom = month_df.tail(n).copy()
+
+        top_w = top["market_cap"] / top["market_cap"].sum()
+        bottom_w = bottom["market_cap"] / bottom["market_cap"].sum()
+        all_w = month_df["market_cap"] / month_df["market_cap"].sum()
+
+        long_ret = float(np.sum(top_w.values * top["return_premium"].values))
+        short_ret = float(np.sum(bottom_w.values * bottom["return_premium"].values))
+        benchmark_ret = float(np.sum(all_w.values * month_df["return_premium"].values))
+
+        # Strategy = full market VW base + 30% dollar-neutral long-short overlay
+        OVERLAY = 0.30
+        strategy_ret = benchmark_ret + OVERLAY * (long_ret - short_ret)
+
+        # Effective weights: market VW base + overlay adjustments
+        current_weights: Dict[str, float] = {}
+        for t, w in zip(month_df["ticker"].astype(str).values, all_w.values):
+            current_weights[t] = current_weights.get(t, 0.0) + float(w)
+        for t, w in zip(top["ticker"].astype(str).values, top_w.values):
+            current_weights[t] = current_weights.get(t, 0.0) + OVERLAY * float(w)
+        for t, w in zip(bottom["ticker"].astype(str).values, bottom_w.values):
+            current_weights[t] = current_weights.get(t, 0.0) - OVERLAY * float(w)
+
+        self._month_weights[month_end.strftime("%Y-%m")] = dict(current_weights)
+
+        if self.prev_weights:
+            universe = set(self.prev_weights) | set(current_weights)
+            turnover = 0.5 * sum(abs(current_weights.get(k, 0.0) - self.prev_weights.get(k, 0.0)) for k in universe)
+        else:
+            turnover = np.nan
+
+        self.prev_weights = current_weights
+
+        self.strategy_nav *= 1.0 + strategy_ret
+        self.benchmark_nav *= 1.0 + benchmark_ret
+
+        self.rebalance_records.append(
+            {
+                "date": month_end,
+                "strategy_return": strategy_ret,
+                "benchmark_return": benchmark_ret,
+                "turnover": turnover,
+                "strategy_nav": self.strategy_nav,
+                "benchmark_nav": self.benchmark_nav,
+            }
+        )
+
+        self.plot("Cumulative", "Strategy", self.strategy_nav)
+        self.plot("Cumulative", "Benchmark", self.benchmark_nav)
+        self.plot("Rebalance", "StrategyReturn", strategy_ret)
+        self.plot("Rebalance", "BenchmarkReturn", benchmark_ret)
+        self.plot("Rebalance", "Turnover", 0.0 if np.isnan(turnover) else float(turnover))
+
+        self.set_runtime_statistic("Model", self.model_id)
+        self.set_runtime_statistic("Date", month_end.strftime("%Y-%m"))
+        self.set_runtime_statistic("Ret(%)", f"{strategy_ret * 100:.2f}")
+
+        self.debug(f"Benchmark return for {month_end}: {benchmark_ret}")
+
+    def on_data(self, data: Slice) -> None:
+        """Use precomputed weights to place real Lean orders each month on custom data bars."""
+        current_month = self.time.strftime("%Y-%m")
+        if current_month == self._last_rebalance_month:
+            return
+        weights = self._month_weights.get(current_month)
+        if weights is None:
+            return
+        self._last_rebalance_month = current_month
+        for ticker, weight in weights.items():
+            sym = self._ticker_to_symbol.get(ticker)
+            if sym is not None and self.securities.contains_key(sym) and self.securities[sym].price > 0:
+                self.set_holdings(sym, weight)
+        for ticker, sym in self._ticker_to_symbol.items():
+            if ticker not in weights and self.portfolio[sym].invested:
+                self.liquidate(sym)
+
+    def on_end_of_algorithm(self) -> None:
+        if not self.rebalance_records:
+            self.debug("No rebalance records produced.")
+            return
+
+        result = pd.DataFrame(self.rebalance_records).sort_values("date").reset_index(drop=True)
+
+        ff_sub = self.ff[["date", "rf", "mkt_rf", "smb", "hml", "rmw", "cma", "umd"]].copy()
+        result = result.merge(ff_sub, on="date", how="left")
+        for col in ["rf", "mkt_rf", "smb", "hml", "rmw", "cma", "umd"]:
+            result[col] = result[col].fillna(0.0)
+
+        strat = result["strategy_return"].values
+        bench = result["benchmark_return"].values
+        rf = result["rf"].values
+
+        strat_excess = strat - rf
+        bench_excess = bench - rf
+
+        alpha_bench, _ = _ols_alpha_and_betas(strat_excess, bench_excess.reshape(-1, 1))
+        ff_factors = result[["mkt_rf", "smb", "hml", "rmw", "cma", "umd"]].values
+        alpha_ff, betas_ff = _ols_alpha_and_betas(strat_excess, ff_factors)
+
+        mean_ret = float(np.mean(strat))
+        vol = float(np.std(strat, ddof=1)) if len(strat) > 1 else np.nan
+        sharpe = (mean_ret / vol * np.sqrt(12.0)) if vol and np.isfinite(vol) and vol > 0 else np.nan
+
+        active = strat - bench
+        active_vol = float(np.std(active, ddof=1)) if len(active) > 1 else np.nan
+        info_ratio = (
+            float(np.mean(active)) / active_vol * np.sqrt(12.0)
+            if active_vol and np.isfinite(active_vol) and active_vol > 0
+            else np.nan
+        )
+
+        turnover = float(np.nanmean(result["turnover"].values)) if "turnover" in result else np.nan
+
+        cumulative = (1.0 + result["strategy_return"]).cumprod()
+        drawdown = cumulative / cumulative.cummax() - 1.0
+        max_drawdown = float(drawdown.min())
+
+        metrics = {
+            "model_id": self.model_id,
+            "n_months": int(len(result)),
+            "alpha_vs_benchmark": _safe_float(alpha_bench, np.nan),
+            "alpha_ff6": _safe_float(alpha_ff, np.nan),
+            "beta_mkt_rf": _safe_float(betas_ff[0] if len(betas_ff) > 0 else np.nan, np.nan),
+            "beta_smb": _safe_float(betas_ff[1] if len(betas_ff) > 1 else np.nan, np.nan),
+            "beta_hml": _safe_float(betas_ff[2] if len(betas_ff) > 2 else np.nan, np.nan),
+            "beta_rmw": _safe_float(betas_ff[3] if len(betas_ff) > 3 else np.nan, np.nan),
+            "beta_cma": _safe_float(betas_ff[4] if len(betas_ff) > 4 else np.nan, np.nan),
+            "beta_umd": _safe_float(betas_ff[5] if len(betas_ff) > 5 else np.nan, np.nan),
+            "drawdown": max_drawdown,
+            "turnover": turnover,
+            "sharpe_ratio": _safe_float(sharpe, np.nan),
+            "information_ratio": _safe_float(info_ratio, np.nan),
+            "avg_rebalance_return": mean_ret,
+            "mean_return": mean_ret,
+            "cumulative_return": float(cumulative.iloc[-1] - 1.0),
+        }
+
+        # Push panel metrics into Lean statistics so lean report JSON includes them.
+        self.set_summary_statistic("model_id", self.model_id)
+        self.set_summary_statistic("n_months", str(metrics["n_months"]))
+        for key, value in metrics.items():
+            if key in {"model_id", "n_months"}:
+                continue
+            self.set_summary_statistic(key, _metric_str(value))
+
+        report_dir = Path(self.report_dir_param)
+        if not report_dir.is_absolute():
+            report_dir = self._project_root / report_dir
+        model_dir = report_dir / self.model_id
+        model_dir.mkdir(parents=True, exist_ok=True)
+
+        monthly_out = result[["date", "strategy_return", "benchmark_return", "turnover", "strategy_nav", "benchmark_nav"]].copy()
+        monthly_out["date"] = monthly_out["date"].dt.strftime("%Y-%m-%d")
+        monthly_out.to_csv(model_dir / "monthly_returns.csv", index=False)
+
+        with open(model_dir / "metrics.json", "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+
+        self.debug(f"Saved reports: {model_dir}")
