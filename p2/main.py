@@ -380,7 +380,12 @@ class MLMonthlyEventDrivenBacktest(QCAlgorithm):
 
         mean_ret = float(np.mean(strat))
         vol = float(np.std(strat, ddof=1)) if len(strat) > 1 else np.nan
-        sharpe = (mean_ret / vol * np.sqrt(12.0)) if vol and np.isfinite(vol) and vol > 0 else np.nan
+        # Sharpe uses excess returns (strat - rf) annualised with sqrt(12) for monthly data.
+        # NOTE: Lean's reported Sharpe will differ because Lean treats each monthly bar as a
+        # daily bar and annualises with sqrt(252); that is a Lean artefact of monthly custom data,
+        # not a meaningful economic number.
+        mean_excess = float(np.mean(strat_excess))
+        sharpe = (mean_excess / vol * np.sqrt(12.0)) if vol and np.isfinite(vol) and vol > 0 else np.nan
 
         active = strat - bench
         active_vol = float(np.std(active, ddof=1)) if len(active) > 1 else np.nan

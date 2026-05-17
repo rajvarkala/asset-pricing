@@ -18,6 +18,10 @@ __pycache__/
 **/*.egg-info/
 *.egg-info
 **/*.egg-info
+
+# Ignore generated synthetic per-ticker ML inputs
+p2/ml_inputs/synthetic_data/by_ticker/
+
 **/backtests/
 
 p2/__pycache__/main.cpython-311.pyc
