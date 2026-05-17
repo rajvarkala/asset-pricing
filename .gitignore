@@ -19,6 +19,10 @@ __pycache__/
 *.egg-info
 **/*.egg-info
 
+# Ignore large data files (use compressed .tgz equivalents instead)
+*.csv
+*.xlsx
+
 # Ignore generated synthetic per-ticker ML inputs
 p2/ml_inputs/synthetic_data/by_ticker/
 
